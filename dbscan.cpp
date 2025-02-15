@@ -1,130 +1,147 @@
 #include "dbscan.hpp"
-
 #include <cstddef>
-#include <nanoflann/nanoflann.hpp>
-
-#include <type_traits>
+#include <pcl/point_types.h>
+#include <pcl/point_cloud.h>
+#include <pcl/kdtree/kdtree_flann.h>
 #include <vector>
+#include <algorithm>
 
-// And this is the "dataset to kd-tree" adaptor class:
-
-inline auto get_pt(const point2& p, std::size_t dim)
-{
-    if(dim == 0) return p.x;
-    return p.y;
-}
-
-
-inline auto get_pt(const point3& p, std::size_t dim)
+// "dataset to kd-tree" adaptor class:
+inline auto get_pt(const pcl::PointXYZ& p, std::size_t dim)
 {
     if(dim == 0) return p.x;
     if(dim == 1) return p.y;
-    return p.z;
+    if(dim == 2) return p.z;
 }
-
 
 template<typename Point>
 struct adaptor
 {
-    const std::span<const Point>&  points;
-    adaptor(const std::span<const Point>&  points) : points(points) { }
+    const std::span<const Point>& points;
 
-    /// CRTP helper method
-    //inline const Derived& derived() const { return obj; }
+    adaptor(const std::span<const Point>& points) : points(points) { }
 
-    // Must return the number of data points
     inline std::size_t kdtree_get_point_count() const { return points.size(); }
 
-    // Returns the dim'th component of the idx'th point in the class:
-    // Since this is inlined and the "dim" argument is typically an immediate value, the
-    //  "if/else's" are actually solved at compile time.
     inline float kdtree_get_pt(const std::size_t idx, const std::size_t dim) const
     {
         return get_pt(points[idx], dim);
     }
 
-    // Optional bounding-box computation: return false to default to a standard bbox computation loop.
-    //   Return true if the BBOX was already computed by the class and returned in "bb" so it can be avoided to redo it again.
-    //   Look at bb.size() to find out the expected dimensionality (e.g. 2 or 3 for point clouds)
     template <class BBOX>
     bool kdtree_get_bbox(BBOX& /*bb*/) const { return false; }
 
-    auto const * elem_ptr(const std::size_t idx) const
+    auto const* elem_ptr(const std::size_t idx) const
     {
         return &points[idx].x;
     }
 };
 
-
-
 auto sort_clusters(std::vector<std::vector<size_t>>& clusters)
 {
-    for(auto& cluster: clusters)
+    for (auto& cluster : clusters)
     {
         std::sort(cluster.begin(), cluster.end());
     }
 }
 
-
-template<int n_cols, typename Adaptor>
-auto dbscan(const Adaptor& adapt, float eps, int min_pts)
+auto dbscan(const std::span<const pcl::PointXYZ>& data, float eps, int min_pts) -> std::vector<std::vector<size_t>>
 {
-    eps *= eps;
-    using namespace nanoflann;
-    using  my_kd_tree_t = KDTreeSingleIndexAdaptor<L2_Simple_Adaptor<float, decltype(adapt)>, decltype(adapt), n_cols>;
+    // Use the PCL KdTree
+    pcl::KdTreeFLANN<pcl::PointXYZ> kd_tree;
 
-    auto index = my_kd_tree_t(n_cols, adapt, KDTreeSingleIndexAdaptorParams(10));
-    index.buildIndex();
+    // Convert std::span to a pcl::PointCloud
+    pcl::PointCloud<pcl::PointXYZ> cloud;
+    cloud.points.resize(data.size());
+    std::memcpy(cloud.points.data(), data.data(), sizeof(pcl::PointXYZ) * data.size());
 
-    const auto n_points = adapt.kdtree_get_point_count();
-    auto visited  = std::vector<bool>(n_points);
-    auto clusters = std::vector<std::vector<size_t>>();
-    auto matches  = std::vector<std::pair<size_t, float>>();
-    auto sub_matches = std::vector<std::pair<size_t, float>>();
+    kd_tree.setInputCloud(cloud.makeShared());
 
-    for(size_t i = 0; i < n_points; i++)
+    std::vector<bool> visited(data.size(), false);
+    std::vector<std::vector<size_t>> clusters;
+
+    for (size_t i = 0; i < data.size(); i++)
     {
         if (visited[i]) continue;
 
-        index.radiusSearch(adapt.elem_ptr(i), eps, matches, SearchParams(32, 0.f, false));
-        if (matches.size() < static_cast<size_t>(min_pts)) continue;
+        std::vector<int> neighbors;
+        std::vector<float> distances;
+
+        // Find neighbors within eps radius
+        kd_tree.radiusSearch(cloud.points[i], eps, neighbors, distances);
+
+        if (neighbors.size() < static_cast<size_t>(min_pts)) continue;
+
+        // Mark the current point as visited
         visited[i] = true;
 
-        auto cluster = std::vector({i});
+        std::vector<size_t> cluster = {i};
 
-        while (matches.empty() == false)
+        // Add all neighbors to the cluster
+        for (size_t idx = 0; idx < neighbors.size(); idx++)
         {
-            auto nb_idx = matches.back().first;
-            matches.pop_back();
-            if (visited[nb_idx]) continue;
-            visited[nb_idx] = true;
-
-            index.radiusSearch(adapt.elem_ptr(nb_idx), eps, sub_matches, SearchParams(32, 0.f, false));
-
-            if (sub_matches.size() >= static_cast<size_t>(min_pts))
+            if (!visited[neighbors[idx]])
             {
-                std::copy(sub_matches.begin(), sub_matches.end(), std::back_inserter(matches));
+                visited[neighbors[idx]] = true;
+                cluster.push_back(neighbors[idx]);
+
+                // Recursively add all the neighbors of the neighbors
+                std::vector<int> sub_neighbors;
+                std::vector<float> sub_distances;
+                kd_tree.radiusSearch(cloud.points[neighbors[idx]], eps, sub_neighbors, sub_distances);
+
+                if (sub_neighbors.size() >= static_cast<size_t>(min_pts))
+                {
+                    neighbors.insert(neighbors.end(), sub_neighbors.begin(), sub_neighbors.end());
+                }
             }
-            cluster.push_back(nb_idx);
         }
-        clusters.emplace_back(std::move(cluster));
+
+        clusters.push_back(std::move(cluster));
     }
+
     sort_clusters(clusters);
+
     return clusters;
 }
 
-
-auto dbscan(const std::span<const point2>& data, float eps, int min_pts) -> std::vector<std::vector<size_t>>
+int main(int argc, char** argv)
 {
-    const auto adapt = adaptor<point2>(data);
+    // Usage check
+    if (argc != 4)
+    {
+        std::cerr << "usage: example <tsv file> <epsilon> <min points>\n";
+        return 1;
+    }
 
-    return dbscan<2>(adapt, eps, min_pts);
-}
+    auto epsilon = std::stof(argv[2]);
+    auto min_pts = std::stoi(argv[3]);
 
+    // Read input data (implement your read_values function here)
+    auto [values, dim] = read_values(argv[1]);
 
-auto dbscan(const std::span<const point3>& data, float eps, int min_pts) -> std::vector<std::vector<size_t>>
-{
-    const auto adapt = adaptor<point3>(data);
+    // Check if the data is 3D
+    if (dim == 3)
+    {
+        // Call the DBSCAN function with PCL-based KD-Tree
+        auto clusters = dbscan(values, epsilon, min_pts);
 
-    return dbscan<3>(adapt, eps, min_pts);
+        // Print the results
+        for (const auto& cluster : clusters)
+        {
+            std::cout << "Cluster: ";
+            for (const auto& idx : cluster)
+            {
+                std::cout << idx << " ";
+            }
+            std::cout << std::endl;
+        }
+    }
+    else
+    {
+        std::cerr << "Error: Only 3D data is supported.\n";
+        return 1;
+    }
+
+    return 0;
 }
